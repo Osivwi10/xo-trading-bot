@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>XO Pulse Trading Bot</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0a0a0f; color: #e0e0e0; font-family: 'Courier New', monospace; min-height: 100vh; }
+
+    .header { background: #111118; border-bottom: 1px solid #222; padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; }
+    .logo { font-size: 20px; font-weight: bold; color: #7c5cff; letter-spacing: 2px; }
+    .mode-badge { padding: 4px 12px; border-radius: 99px; font-size: 12px; font-weight: bold; }
+    .mode-paper { background: #2a1f00; color: #f0a500; border: 1px solid #f0a500; }
+    .mode-live { background: #0a2a0a; color: #00cc44; border: 1px solid #00cc44; }
+    .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+    .status-dot.on { background: #00cc44; box-shadow: 0 0 6px #00cc44; animation: pulse 2s infinite; }
+    .status-dot.off { background: #666; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; padding: 24px; }
+    .card { background: #111118; border: 1px solid #222; border-radius: 12px; padding: 20px; }
+    .card-label { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+    .card-value { font-size: 28px; font-weight: bold; color: #fff; }
+    .card-value.green { color: #00cc44; }
+    .card-value.red { color: #ff4444; }
+    .card-value.purple { color: #7c5cff; }
+    .card-sub { font-size: 12px; color: #555; margin-top: 4px; }
+
+    .section { padding: 0 24px 24px; }
+    .section-title { font-size: 13px; color: #555; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px; }
+
+    /* BTC Price Bar */
+    .price-bar { background: #111118; border: 1px solid #222; border-radius: 12px; padding: 20px; margin: 0 24px 24px; }
+    .price-row { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+    .btc-price { font-size: 32px; font-weight: bold; color: #fff; }
+    .delta { font-size: 18px; font-weight: bold; }
+    .delta.up { color: #00cc44; }
+    .delta.down { color: #ff4444; }
+    .window-info { margin-left: auto; text-align: right; }
+    .window-label { font-size: 11px; color: #555; }
+    .window-timer { font-size: 24px; font-weight: bold; color: #7c5cff; }
+
+    /* Window progress bar */
+    .progress-wrap { background: #1a1a24; border-radius: 99px; height: 8px; margin-top: 12px; overflow: hidden; }
+    .progress-fill { height: 8px; border-radius: 99px; background: linear-gradient(90deg, #7c5cff, #00cc44); transition: width 1s linear; }
+    .progress-fill.danger { background: linear-gradient(90deg, #ff4444, #ff8800); }
+
+    /* Decision panel */
+    .decision { background: #111118; border: 1px solid #222; border-radius: 12px; padding: 20px; margin: 0 24px 24px; }
+    .decision-action { font-size: 20px; font-weight: bold; margin-bottom: 8px; }
+    .decision-action.buy-up { color: #00cc44; }
+    .decision-action.buy-down { color: #ff4444; }
+    .decision-action.skip { color: #555; }
+    .decision-reason { font-size: 13px; color: #888; }
+    .prob-bars { display: flex; gap: 8px; margin-top: 12px; align-items: center; }
+    .prob-label { font-size: 12px; color: #555; width: 40px; }
+    .prob-bar-wrap { flex: 1; background: #1a1a24; border-radius: 99px; height: 6px; }
+    .prob-bar-fill { height: 6px; border-radius: 99px; transition: width 0.5s; }
+    .prob-bar-fill.up { background: #00cc44; }
+    .prob-bar-fill.down { background: #ff4444; }
+    .prob-val { font-size: 12px; width: 45px; text-align: right; }
+
+    /* Trade log */
+    .trade-log { background: #111118; border: 1px solid #222; border-radius: 12px; padding: 20px; }
+    .trade-row { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid #1a1a1a; font-size: 13px; }
+    .trade-row:last-child { border-bottom: none; }
+    .trade-dir { font-weight: bold; width: 50px; }
+    .trade-dir.up { color: #00cc44; }
+    .trade-dir.down { color: #ff4444; }
+    .trade-status { padding: 2px 8px; border-radius: 99px; font-size: 11px; font-weight: bold; }
+    .trade-status.win { background: #0a2a0a; color: #00cc44; }
+    .trade-status.loss { background: #2a0a0a; color: #ff4444; }
+    .trade-status.open { background: #1a1a2a; color: #7c5cff; }
+    .trade-pnl { margin-left: auto; font-weight: bold; }
+    .trade-pnl.pos { color: #00cc44; }
+    .trade-pnl.neg { color: #ff4444; }
+
+    .start-btn { display: block; width: calc(100% - 48px); margin: 0 24px 24px; padding: 18px; background: #7c5cff; color: #fff; border: none; border-radius: 12px; font-size: 18px; font-weight: bold; letter-spacing: 2px; cursor: pointer; transition: background 0.2s; }
+    .start-btn:hover { background: #9b7fff; }
+    .start-btn.running { background: #2a0a0a; color: #ff4444; border: 1px solid #ff4444; }
+
+    .empty { color: #333; font-size: 13px; text-align: center; padding: 20px; }
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <div class="logo">⚡ XO PULSE BOT</div>
+  <div style="display:flex;align-items:center;gap:12px;">
+    <span><span class="status-dot off" id="status-dot"></span><span id="status-text" style="font-size:13px;color:#555">Disconnected</span></span>
+    <span class="mode-badge mode-paper" id="mode-badge">PAPER TRADING</span>
+  </div>
+</div>
+
+<!-- Stats Grid -->
+<div class="grid">
+  <div class="card">
+    <div class="card-label">Balance</div>
+    <div class="card-value green" id="balance">$300.00</div>
+    <div class="card-sub">Paper USDC</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Win Rate (24h)</div>
+    <div class="card-value purple" id="winrate24h">—</div>
+    <div class="card-sub" id="trades24h">0 trades today</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Win Rate (All Time)</div>
+    <div class="card-value purple" id="winrate">—</div>
+    <div class="card-sub" id="total-trades">0 total trades</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Total P&L</div>
+    <div class="card-value" id="total-pnl">$0.00</div>
+    <div class="card-sub" id="avg-edge">Avg edge: —</div>
+  </div>
+</div>
+
+<!-- BTC Price -->
+<div class="price-bar">
+  <div class="price-row">
+    <div>
+      <div style="font-size:11px;color:#555;margin-bottom:4px;">BTC/USD (Binance)</div>
+      <div class="btc-price" id="btc-price">—</div>
+    </div>
+    <div class="delta up" id="btc-delta">—</div>
+    <div class="window-info">
+      <div class="window-label">Window closes in</div>
+      <div class="window-timer" id="window-timer">—</div>
+      <div style="font-size:11px;color:#555;margin-top:2px;" id="window-open">Open: —</div>
+    </div>
+  </div>
+  <div class="progress-wrap">
+    <div class="progress-fill" id="progress-fill" style="width:100%"></div>
+  </div>
+</div>
+
+<!-- Decision Panel -->
+<div class="decision">
+  <div class="section-title">Current Decision</div>
+  <div class="decision-action skip" id="decision-action">Waiting for data...</div>
+  <div class="decision-reason" id="decision-reason"></div>
+  <div class="prob-bars" id="prob-bars" style="display:none;">
+    <span class="prob-label" style="color:#00cc44">UP</span>
+    <div class="prob-bar-wrap"><div class="prob-bar-fill up" id="up-bar" style="width:50%"></div></div>
+    <span class="prob-val" id="up-prob" style="color:#00cc44">50%</span>
+    <span class="prob-label" style="color:#ff4444;text-align:right">DN</span>
+    <div class="prob-bar-wrap"><div class="prob-bar-fill down" id="dn-bar" style="width:50%"></div></div>
+    <span class="prob-val" id="dn-prob" style="color:#ff4444">50%</span>
+  </div>
+</div>
+
+<!-- Trade Log -->
+<div class="section">
+  <div class="section-title">Recent Trades</div>
+  <div class="trade-log" id="trade-log">
+    <div class="empty">No trades yet — bot will start trading when edge is detected</div>
+  </div>
+</div>
+
+<button class="start-btn" id="start-btn" onclick="toggleBot()">▶ PRESS TO START</button>
+
+<script>
+  let ws = null;
+  let running = false;
+  let trades = [];
+
+  function toggleBot() {
+    if (!running) {
+      connect();
+    } else {
+      disconnect();
+    }
+  }
+
+  function connect() {
+    // Connect to bot WebSocket (port 3001)
+    const wsUrl = `ws://${location.hostname}:3001`;
+    ws = new WebSocket(wsUrl);
+
+    ws.onopen = () => {
+      running = true;
+      document.getElementById("start-btn").textContent = "⏹ STOP BOT";
+      document.getElementById("start-btn").classList.add("running");
+      document.getElementById("status-dot").classList.remove("off");
+      document.getElementById("status-dot").classList.add("on");
+      document.getElementById("status-text").textContent = "Connected";
+      document.getElementById("status-text").style.color = "#00cc44";
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        updateDashboard(data);
+      } catch(e) {}
+    };
+
+    ws.onclose = () => disconnect();
+    ws.onerror = () => disconnect();
+  }
+
+  function disconnect() {
+    running = false;
+    if (ws) { ws.close(); ws = null; }
+    document.getElementById("start-btn").textContent = "▶ PRESS TO START";
+    document.getElementById("start-btn").classList.remove("running");
+    document.getElementById("status-dot").classList.remove("on");
+    document.getElementById("status-dot").classList.add("off");
+    document.getElementById("status-text").textContent = "Disconnected";
+    document.getElementById("status-text").style.color = "#555";
+  }
+
+  function updateDashboard(d) {
+    // Stats
+    if (d.stats) {
+      const s = d.stats;
+      document.getElementById("balance").textContent = `$${parseFloat(s.balance).toFixed(2)}`;
+      document.getElementById("winrate24h").textContent = s.trades24h > 0 ? `${s.winRate24h}%` : "—";
+      document.getElementById("trades24h").textContent = `${s.trades24h} trades today`;
+      document.getElementById("winrate").textContent = s.totalTrades > 0 ? `${s.winRate}%` : "—";
+      document.getElementById("total-trades").textContent = `${s.totalTrades} total trades`;
+      const pnlEl = document.getElementById("total-pnl");
+      pnlEl.textContent = `${parseFloat(s.totalPnl) >= 0 ? "+" : ""}$${s.totalPnl}`;
+      pnlEl.className = `card-value ${parseFloat(s.totalPnl) >= 0 ? "green" : "red"}`;
+      document.getElementById("avg-edge").textContent = `Avg edge: ${s.avgEdge}¢`;
+    }
+
+    // BTC Price
+    if (d.price) {
+      document.getElementById("btc-price").textContent = `$${d.price.current.toLocaleString("en-US", {minimumFractionDigits:2, maximumFractionDigits:2})}`;
+      const delta = d.price.delta;
+      const deltaEl = document.getElementById("btc-delta");
+      deltaEl.textContent = `${delta >= 0 ? "▲ +" : "▼ "}$${Math.abs(delta).toFixed(2)}`;
+      deltaEl.className = `delta ${delta >= 0 ? "up" : "down"}`;
+      document.getElementById("window-open").textContent = `Open: $${d.price.windowOpen?.toFixed(2) || "—"}`;
+    }
+
+    // Window timer
+    if (d.window) {
+      const secs = Math.max(0, d.window.secondsRemaining);
+      document.getElementById("window-timer").textContent = `${secs}s`;
+      const pct = (secs / 300) * 100;
+      const fill = document.getElementById("progress-fill");
+      fill.style.width = `${pct}%`;
+      fill.className = `progress-fill ${secs <= 10 ? "danger" : ""}`;
+    }
+
+    // Decision
+    if (d.decision) {
+      const dec = d.decision;
+      const actionEl = document.getElementById("decision-action");
+      const reasonEl = document.getElementById("decision-reason");
+      const probBars = document.getElementById("prob-bars");
+
+      if (dec.action === "BUY_UP") {
+        actionEl.textContent = `🟢 BUY UP — ${(dec.edge * 100).toFixed(1)}¢ edge`;
+        actionEl.className = "decision-action buy-up";
+      } else if (dec.action === "BUY_DOWN") {
+        actionEl.textContent = `🔴 BUY DOWN — ${(dec.edge * 100).toFixed(1)}¢ edge`;
+        actionEl.className = "decision-action buy-down";
+      } else {
+        actionEl.textContent = `⏸ SKIP`;
+        actionEl.className = "decision-action skip";
+      }
+      reasonEl.textContent = dec.reason || "";
+
+      if (dec.upProb !== null) {
+        probBars.style.display = "flex";
+        const upPct = (dec.upProb * 100).toFixed(1);
+        const dnPct = (dec.downProb * 100).toFixed(1);
+        document.getElementById("up-bar").style.width = `${upPct}%`;
+        document.getElementById("dn-bar").style.width = `${dnPct}%`;
+        document.getElementById("up-prob").textContent = `${upPct}%`;
+        document.getElementById("dn-prob").textContent = `${dnPct}%`;
+      }
+    }
+
+    // Trades
+    if (d.trades) {
+      trades = d.trades;
+      renderTrades();
+    }
+  }
+
+  function renderTrades() {
+    const log = document.getElementById("trade-log");
+    if (trades.length === 0) {
+      log.innerHTML = '<div class="empty">No trades yet</div>';
+      return;
+    }
+    const recent = [...trades].reverse().slice(0, 10);
+    log.innerHTML = recent.map(t => `
+      <div class="trade-row">
+        <span class="trade-dir ${t.direction === "UP" ? "up" : "down"}">${t.direction}</span>
+        <span class="trade-status ${t.status === "WIN" ? "win" : t.status === "LOSS" ? "loss" : "open"}">${t.status}</span>
+        <span style="color:#555;font-size:12px">${t.shares} shares @ $${t.price?.toFixed(3)}</span>
+        <span class="trade-pnl ${t.pnl >= 0 ? "pos" : "neg"}" style="margin-left:auto">
+          ${t.pnl !== undefined ? `${t.pnl >= 0 ? "+" : ""}$${t.pnl?.toFixed(2)}` : "OPEN"}
+        </span>
+      </div>
+    `).join("");
+  }
+</script>
+</body>
+</html>

@@ -9,6 +9,7 @@ let currentPosition = null;
 let positionCount = 0;
 let totalInvested = 0;
 let isTrading = false;
+let contractReady = false;
 let provider = null;
 let signer = null;
 let contract = null;
@@ -30,12 +31,14 @@ async function setup() {
   const decimals = await usdcContract.decimals();
   log(`💰 USDC Balance: $${ethers.formatUnits(balance, decimals)}`);
 
-  contract = new ethers.Contract(
-    config.XO_CONTRACT_ADDRESS,
-    require("./abi.json"),
-    signer
-  );
-  log("✅ Contract loaded. Starting price feed...\n");
+  const addr = config.XO_CONTRACT_ADDRESS;
+  if (!addr || addr.includes("PENDING") || addr.includes("YOUR_XO")) {
+    log("⚠️  Contract not configured yet - price feed only mode");
+  } else {
+    contract = new ethers.Contract(addr, require("./abi.json"), signer);
+    contractReady = true;
+    log("✅ Contract loaded. Starting price feed...\n");
+  }
 }
 
 function startPriceFeed() {
@@ -79,7 +82,7 @@ function resetWindow() {
 }
 
 async function evaluateStrategy() {
-  if (!windowOpenPrice || !currentPrice || isTrading) return;
+  if (!windowOpenPrice || !currentPrice || isTrading || !contractReady) return;
 
   const delta = currentPrice - windowOpenPrice;
   const absDelta = Math.abs(delta);

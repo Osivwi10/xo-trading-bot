@@ -1,192 +1,254 @@
-const { ethers } = require("ethers");
+/**
+ * XO Pulse Trading Bot v2
+ * 
+ * Strategy: At T-6 seconds before 5-min window close,
+ * BTC has basically moved where it's going. Buy the
+ * near-certain winner if market price still has 2¢+ edge.
+ * 
+ * Currently runs in PAPER TRADING mode.
+ * Switch PAPER_MODE=false when RPC key is ready.
+ */
+
 const WebSocket = require("ws");
-const config = require("./config");
-const { log, logTrade, logPrice } = require("./logger");
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
 
-let windowOpenPrice = null;
+const { makeDecision, TRADE_WINDOW_SECONDS } = require("./edge");
+const { getMarketPrices } = require("./markets");
+const PaperTrader = require("./paper");
+
+const PAPER_MODE = process.env.PAPER_MODE !== "false"; // Default: paper trading
+const POLL_INTERVAL_MS = 1000;   // Poll market prices every 1 second
+const DASHBOARD_PORT = process.env.PORT || 3001;
+
+// ── State ─────────────────────────────────────────────────────────────────────
 let currentPrice = null;
-let currentPosition = null;
-let positionCount = 0;
-let totalInvested = 0;
-let isTrading = false;
-let contractReady = false;
-let provider = null;
-let signer = null;
-let contract = null;
+let windowOpenPrice = null;
+let windowStartTime = null;
+let currentDecision = null;
+let lastDecisionTime = 0;
+let tradedThisWindow = false;
+let activeMarketId = null;
 
-async function setup() {
-  log("🚀 XO Market Pulse Bot starting...");
-  provider = new ethers.JsonRpcProvider(config.BASE_RPC_URL);
-  signer = new ethers.Wallet(config.PRIVATE_KEY, provider);
-  const network = await provider.getNetwork();
-  log(`✅ Connected to: ${network.name} (chainId: ${network.chainId})`);
-  log(`👛 Wallet: ${signer.address}`);
+const paper = new PaperTrader();
+const wssClients = new Set();
 
-  const usdcContract = new ethers.Contract(
-    config.USDC_ADDRESS,
-    ["function balanceOf(address) view returns (uint256)", "function decimals() view returns (uint8)"],
-    provider
-  );
-  const balance = await usdcContract.balanceOf(signer.address);
-  const decimals = await usdcContract.decimals();
-  log(`💰 USDC Balance: $${ethers.formatUnits(balance, decimals)}`);
-
-  const addr = config.XO_CONTRACT_ADDRESS;
-  if (!addr || addr.includes("PENDING") || addr.includes("YOUR_XO")) {
-    log("⚠️  Contract not configured yet - price feed only mode");
-  } else {
-    contract = new ethers.Contract(addr, require("./abi.json"), signer);
-    contractReady = true;
-    log("✅ Contract loaded. Starting price feed...\n");
-  }
+// ── Logging ───────────────────────────────────────────────────────────────────
+function log(msg) {
+  const line = `[${new Date().toISOString().substring(11,19)}] ${msg}`;
+  console.log(line);
+  fs.appendFileSync("bot.log", line + "\n");
 }
 
+// ── Dashboard WebSocket Server ─────────────────────────────────────────────
+function startDashboard() {
+  const server = http.createServer((req, res) => {
+    if (req.url === "/" || req.url === "/dashboard") {
+      const html = fs.readFileSync(path.join(__dirname, "dashboard.html"));
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end(html);
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+
+  const wss = new WebSocket.Server({ server });
+  wss.on("connection", (ws) => {
+    wssClients.add(ws);
+    ws.on("close", () => wssClients.delete(ws));
+    // Send current state immediately on connect
+    broadcastState();
+  });
+
+  server.listen(DASHBOARD_PORT, () => {
+    log(`📊 Dashboard: http://localhost:${DASHBOARD_PORT}`);
+  });
+}
+
+function broadcastState() {
+  const state = buildState();
+  const msg = JSON.stringify(state);
+  wssClients.forEach(ws => {
+    if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+  });
+}
+
+function buildState() {
+  const now = Date.now();
+  const windowElapsed = windowStartTime ? (now - windowStartTime) / 1000 : 0;
+  const secondsRemaining = Math.max(0, 300 - windowElapsed);
+  const stats = paper.getStats();
+
+  return {
+    price: {
+      current: currentPrice,
+      windowOpen: windowOpenPrice,
+      delta: currentPrice && windowOpenPrice ? currentPrice - windowOpenPrice : 0
+    },
+    window: {
+      secondsRemaining: Math.round(secondsRemaining),
+      elapsed: Math.round(windowElapsed),
+      startPrice: windowOpenPrice
+    },
+    decision: currentDecision,
+    stats,
+    trades: paper.trades.slice(-20),
+    mode: PAPER_MODE ? "paper" : "live",
+    marketId: activeMarketId
+  };
+}
+
+// ── Binance Price Feed ─────────────────────────────────────────────────────
 function startPriceFeed() {
   const ws = new WebSocket("wss://stream.binance.com:9443/ws/btcusdt@trade");
 
   ws.on("open", () => {
-    log("✅ Binance price feed connected.\n");
-    resetWindow();
+    log("✅ Binance price feed connected");
+    initWindow();
   });
 
   ws.on("message", (data) => {
     const trade = JSON.parse(data);
     currentPrice = parseFloat(trade.p);
-    logPrice(currentPrice, windowOpenPrice);
-    evaluateStrategy();
+    broadcastState();
   });
 
-  ws.on("error", (err) => log(`❌ WebSocket error: ${err.message}`));
-
+  ws.on("error", (e) => log(`❌ Binance WS error: ${e.message}`));
   ws.on("close", () => {
-    log("⚠️  Price feed disconnected. Reconnecting in 3s...");
+    log("⚠️  Binance disconnected — reconnecting in 3s...");
     setTimeout(startPriceFeed, 3000);
   });
 }
 
-function resetWindow() {
+// ── Window Management ──────────────────────────────────────────────────────
+function initWindow() {
   const now = Date.now();
-  const msUntilNext = (5 * 60 * 1000) - (now % (5 * 60 * 1000));
+  const msInWindow = now % (5 * 60 * 1000);
+  const msUntilNext = (5 * 60 * 1000) - msInWindow;
+  const secondsIntoWindow = msInWindow / 1000;
 
-  if (currentPrice) {
+  // Set window open price (approximate — we set it from current price)
+  if (currentPrice && !windowOpenPrice) {
     windowOpenPrice = currentPrice;
-    currentPosition = null;
-    positionCount = 0;
-    totalInvested = 0;
-    isTrading = false;
-    log(`\n🕐 New 5-min window. Open price: $${windowOpenPrice.toFixed(2)}`);
-    log(`⏰ Next reset in: ${Math.round(msUntilNext / 1000)}s\n`);
+    windowStartTime = now - msInWindow;
+    log(`🕐 Window started ${secondsIntoWindow.toFixed(0)}s ago. Open: $${windowOpenPrice.toFixed(2)}`);
   }
 
-  setTimeout(resetWindow, msUntilNext);
+  // Schedule next window reset
+  log(`⏰ Next window in ${(msUntilNext / 1000).toFixed(0)}s`);
+  setTimeout(() => resetWindow(), msUntilNext);
 }
 
-async function evaluateStrategy() {
-  if (!windowOpenPrice || !currentPrice || isTrading || !contractReady) return;
+function resetWindow() {
+  if (currentPrice) {
+    // Settle any open paper trade at end of window
+    if (paper.openTrade && windowOpenPrice) {
+      const wonDirection = currentPrice >= windowOpenPrice ? "UP" : "DOWN";
+      log(`\n🏁 Window closed! BTC: $${currentPrice.toFixed(2)} | Open: $${windowOpenPrice.toFixed(2)} | Winner: ${wonDirection}`);
+      paper.settle(wonDirection);
+    }
 
-  const delta = currentPrice - windowOpenPrice;
-  const absDelta = Math.abs(delta);
-  const direction = delta >= 0 ? "UP" : "DOWN";
+    windowOpenPrice = currentPrice;
+    windowStartTime = Date.now();
+    tradedThisWindow = false;
+    currentDecision = null;
 
-  if (currentPosition && currentPosition !== direction && absDelta < config.REVERSAL_THRESHOLD) {
-    log(`🔄 REVERSAL! Price moving against ${currentPosition} position.`);
-    await sellCurrentPosition();
-    await buyPosition(direction, config.BET_AMOUNT_SMALL, "Reversal buy");
-    return;
+    log(`\n🕐 NEW WINDOW | Open: $${windowOpenPrice.toFixed(2)}`);
+    broadcastState();
   }
 
-  if (!currentPosition && absDelta >= config.THRESHOLD_FIRST_BUY) {
-    log(`📈 First threshold hit! Delta: $${delta.toFixed(2)} → Buying ${direction}`);
-    await buyPosition(direction, config.BET_AMOUNT_SMALL, "Initial buy");
-    return;
-  }
-
-  if (currentPosition === direction && positionCount === 1 && absDelta >= config.THRESHOLD_SECOND_BUY) {
-    log(`📈 Second threshold hit! Adding to ${direction}`);
-    await buyPosition(direction, config.BET_AMOUNT_LARGE, "Momentum buy");
-    return;
-  }
+  // Next reset in exactly 5 minutes
+  setTimeout(() => resetWindow(), 5 * 60 * 1000);
 }
 
-async function buyPosition(direction, amount, reason) {
-  if (isTrading) return;
-  isTrading = true;
+// ── Strategy Loop ──────────────────────────────────────────────────────────
+async function strategyLoop() {
+  if (!currentPrice || !windowOpenPrice || !windowStartTime) return;
+
+  const now = Date.now();
+  const windowElapsed = (now - windowStartTime) / 1000;
+  const secondsRemaining = Math.max(0, 300 - windowElapsed);
+  const deltaUSD = currentPrice - windowOpenPrice;
+
+  // Fetch live market prices from XO orderbook
+  let upPrice = 0.5;
+  let downPrice = 0.5;
+
+  if (activeMarketId) {
+    const prices = await getMarketPrices(activeMarketId);
+    if (prices) {
+      upPrice = prices.upPrice || 0.5;
+      downPrice = prices.downPrice || 0.5;
+    }
+  }
+
+  // Run decision engine
+  const decision = makeDecision({ deltaUSD, secondsRemaining, upPrice, downPrice });
+  currentDecision = decision;
+
+  // Log decision every 5 seconds
+  if (now - lastDecisionTime > 5000) {
+    lastDecisionTime = now;
+    const remaining = secondsRemaining.toFixed(0);
+    log(`T-${remaining}s | BTC Δ$${deltaUSD.toFixed(2)} | UP=${upPrice.toFixed(3)} DN=${downPrice.toFixed(3)} | ${decision.action}: ${decision.reason}`);
+  }
+
+  // Execute if we have edge and haven't traded this window
+  if (!tradedThisWindow && decision.action !== "SKIP") {
+    if (secondsRemaining <= TRADE_WINDOW_SECONDS && secondsRemaining > 0) {
+      tradedThisWindow = true;
+
+      if (PAPER_MODE) {
+        const price = decision.action === "BUY_UP" ? upPrice : downPrice;
+        paper.buy(
+          decision.action === "BUY_UP" ? "UP" : "DOWN",
+          price,
+          decision.edge,
+          activeMarketId,
+          windowOpenPrice,
+          deltaUSD
+        );
+      } else {
+        log("🔴 LIVE TRADING not yet enabled — add RPC key to activate");
+      }
+    }
+  }
+
+  broadcastState();
+}
+
+// ── Market Discovery Loop ──────────────────────────────────────────────────
+async function marketDiscoveryLoop() {
   try {
-    const amountWei = ethers.parseUnits(amount.toString(), 6);
-    log(`\n🟢 BUYING ${direction} | $${amount} USDC | ${reason}`);
-    log(`   Price: $${currentPrice.toFixed(2)} | Delta: $${(currentPrice - windowOpenPrice).toFixed(2)}`);
-
-    await approveUSDC(amountWei);
-
-    const tx = await contract.buyPosition(
-      direction === "UP" ? 0 : 1,
-      amountWei,
-      { gasLimit: config.GAS_LIMIT, maxFeePerGas: ethers.parseUnits(config.MAX_GAS_GWEI, "gwei") }
-    );
-    log(`   📤 TX: ${tx.hash}`);
-    const receipt = await tx.wait();
-    log(`   ✅ Confirmed in block ${receipt.blockNumber}`);
-
-    currentPosition = direction;
-    positionCount++;
-    totalInvested += amount;
-    logTrade("BUY", direction, amount, currentPrice, tx.hash);
-  } catch (err) {
-    log(`   ❌ Buy failed: ${err.message}`);
-  } finally {
-    isTrading = false;
+    const { getCurrentMarket } = require("./markets");
+    const market = await getCurrentMarket();
+    if (market && market.condition_id !== activeMarketId) {
+      activeMarketId = market.condition_id;
+      log(`📍 Active market: ${activeMarketId}`);
+    }
+  } catch (e) {
+    // Silently continue — market discovery is best-effort
   }
+
+  setTimeout(marketDiscoveryLoop, 30000); // Refresh every 30s
 }
 
-async function sellCurrentPosition() {
-  if (isTrading || !currentPosition) return;
-  isTrading = true;
-  try {
-    log(`\n🔴 SELLING ${currentPosition} | Price: $${currentPrice.toFixed(2)}`);
-    const tx = await contract.sellPosition(
-      currentPosition === "UP" ? 0 : 1,
-      { gasLimit: config.GAS_LIMIT, maxFeePerGas: ethers.parseUnits(config.MAX_GAS_GWEI, "gwei") }
-    );
-    log(`   📤 TX: ${tx.hash}`);
-    const receipt = await tx.wait();
-    log(`   ✅ Confirmed in block ${receipt.blockNumber}`);
-    logTrade("SELL", currentPosition, totalInvested, currentPrice, tx.hash);
-    currentPosition = null;
-    positionCount = 0;
-    totalInvested = 0;
-  } catch (err) {
-    log(`   ❌ Sell failed: ${err.message}`);
-  } finally {
-    isTrading = false;
-  }
-}
-
-async function approveUSDC(amountWei) {
-  const usdcContract = new ethers.Contract(
-    config.USDC_ADDRESS,
-    ["function allowance(address,address) view returns (uint256)", "function approve(address,uint256) returns (bool)"],
-    signer
-  );
-  const allowance = await usdcContract.allowance(signer.address, config.XO_CONTRACT_ADDRESS);
-  if (allowance < amountWei) {
-    log("   🔑 Approving USDC...");
-    const tx = await usdcContract.approve(config.XO_CONTRACT_ADDRESS, ethers.MaxUint256);
-    await tx.wait();
-    log("   ✅ USDC approved.");
-  }
-}
-
+// ── Main ───────────────────────────────────────────────────────────────────
 (async () => {
-  try {
-    await setup();
-    startPriceFeed();
-    process.on("SIGINT", () => {
-      log("\n⛔ Bot stopped.");
-      if (currentPosition) log(`⚠️  Open ${currentPosition} position — check beta.xo.market/pulse manually.`);
-      process.exit(0);
-    });
-  } catch (err) {
-    log(`💥 Fatal: ${err.message}`);
-    process.exit(1);
-  }
+  log("🚀 XO Pulse Bot v2 starting...");
+  log(`📄 Mode: ${PAPER_MODE ? "PAPER TRADING" : "LIVE TRADING"}`);
+
+  startDashboard();
+  startPriceFeed();
+  marketDiscoveryLoop();
+
+  // Run strategy loop every second
+  setInterval(strategyLoop, POLL_INTERVAL_MS);
+
+  process.on("SIGINT", () => {
+    log("\n⛔ Bot stopped.");
+    process.exit(0);
+  });
 })();

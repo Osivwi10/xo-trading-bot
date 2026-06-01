@@ -1,0 +1,21 @@
+[
+  {
+    "name": "buyPosition",
+    "type": "function",
+    "stateMutability": "nonpayable",
+    "inputs": [
+      { "name": "direction", "type": "uint8" },
+      { "name": "amount", "type": "uint256" }
+    ],
+    "outputs": []
+  },
+  {
+    "name": "sellPosition",
+    "type": "function",
+    "stateMutability": "nonpayable",
+    "inputs": [
+      { "name": "direction", "type": "uint8" }
+    ],
+    "outputs": []
+  }
+]
